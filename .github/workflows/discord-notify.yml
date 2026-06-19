@@ -1,10 +1,11 @@
-name: Discord Notify
+name: Discord CI Notify
 
 on:
   push:
     branches:
       - main
       - dev
+
   pull_request:
     branches:
       - main
@@ -16,101 +17,105 @@ on:
       - ready_for_review
       - converted_to_draft
       - closed
+
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  notify:
-    name: Send Discord notification
+  notify-discord:
+    name: Notify Discord
     runs-on: ubuntu-latest
 
     steps:
-      - name: Notify Discord
+      - name: Send Discord notification
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_CICD }}
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_ACTION: ${{ github.event.action || '' }}
+          EVENT_ACTION: ${{ github.event.action }}
           REPOSITORY: ${{ github.repository }}
-          REF_NAME: ${{ github.head_ref || github.ref_name }}
-          BASE_REF: ${{ github.base_ref || '' }}
           ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
           SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          PR_TITLE: ${{ github.event.pull_request.title || '' }}
-          PR_URL: ${{ github.event.pull_request.html_url || '' }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
-          COMMIT_URL: ${{ github.event.head_commit.url || '' }}
-        shell: bash
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import urllib.request
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK_CICD is empty. Please add it in GitHub Secrets."
+            exit 0
+          fi
 
-          def value(name, default=""):
-              return os.environ.get(name, default).strip()
+          if [[ "$DISCORD_WEBHOOK" == */github ]]; then
+            echo "ERROR: This workflow uses normal Discord webhook URL, not /github URL."
+            echo "Please remove /github from DISCORD_WEBHOOK_CICD."
+            exit 1
+          fi
 
-          webhook = value("DISCORD_WEBHOOK")
-          if not webhook:
-              print("DISCORD_WEBHOOK_CICD is not configured. Skipping Discord notification.")
-              raise SystemExit(0)
+          SHORT_SHA="${SHA:0:7}"
 
-          event_name = value("EVENT_NAME")
-          event_action = value("EVENT_ACTION")
-          repository = value("REPOSITORY")
-          ref_name = value("REF_NAME", "unknown")
-          base_ref = value("BASE_REF")
-          actor = value("ACTOR")
-          sha = value("SHA")[:7]
-          run_url = value("RUN_URL")
-          pr_title = value("PR_TITLE")
-          pr_url = value("PR_URL")
-          commit_message = value("COMMIT_MESSAGE")
-          commit_url = value("COMMIT_URL")
+          if [ -n "$PR_TITLE" ]; then
+            SUMMARY="$PR_TITLE"
+            EVENT_URL="$PR_URL"
+          elif [ -n "$COMMIT_MESSAGE" ]; then
+            SUMMARY="$(echo "$COMMIT_MESSAGE" | head -n 1)"
+            EVENT_URL="$COMMIT_URL"
+          else
+            SUMMARY="Manual workflow run"
+            EVENT_URL="$RUN_URL"
+          fi
 
-          action_label = f" / {event_action}" if event_action else ""
-          target_line = f"\nTarget: `{base_ref}`" if base_ref else ""
-          if pr_title:
-              summary = pr_title
-          elif commit_message:
-              summary = commit_message.splitlines()[0]
-          else:
-              summary = "Manual workflow run"
-          event_url = pr_url or commit_url or run_url
+          if [ -n "$EVENT_ACTION" ]; then
+            TITLE="$REPOSITORY: $EVENT_NAME / $EVENT_ACTION"
+          else
+            TITLE="$REPOSITORY: $EVENT_NAME"
+          fi
 
-          payload = {
-              "content": f"GitHub **{event_name.upper()}** notification for `{repository}`",
-              "embeds": [
+          if [ -n "$BASE_REF" ]; then
+            TARGET_LINE="Target: \`$BASE_REF\`\n"
+          else
+            TARGET_LINE=""
+          fi
+
+          cat > payload.json <<EOF
+          {
+            "content": "GitHub **${EVENT_NAME^^}** notification for \`$REPOSITORY\`",
+            "embeds": [
+              {
+                "title": "$TITLE",
+                "url": "$EVENT_URL",
+                "description": "Actor: \`$ACTOR\`\nBranch: \`$REF_NAME\`\n${TARGET_LINE}Commit: \`$SHORT_SHA\`\nRun: $RUN_URL",
+                "fields": [
                   {
-                      "title": f"{repository}: {event_name}{action_label}",
-                      "url": event_url,
-                      "description": (
-                          f"Actor: `{actor}`\n"
-                          f"Branch: `{ref_name}`"
-                          f"{target_line}\n"
-                          f"Commit: `{sha}`\n"
-                          f"Run: {run_url}"
-                      ),
-                      "fields": [
-                          {
-                              "name": "Summary",
-                              "value": summary[:1024],
-                          }
-                      ],
-                      "color": 3447003,
+                    "name": "Summary",
+                    "value": "$SUMMARY"
                   }
-              ],
+                ],
+                "color": 3447003
+              }
+            ]
           }
+          EOF
 
-          request = urllib.request.Request(
-              webhook,
-              data=json.dumps(payload).encode("utf-8"),
-              headers={"Content-Type": "application/json"},
-              method="POST",
-          )
+          echo "Sending Discord notification..."
 
-          with urllib.request.urlopen(request, timeout=15) as response:
-              print(f"Discord notification sent: HTTP {response.status}")
-          PY
+          HTTP_CODE=$(curl -sS -o response.txt -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: GitHub-Actions-Discord-Notifier" \
+            --data @payload.json \
+            "$DISCORD_WEBHOOK")
+
+          echo "Discord HTTP code: $HTTP_CODE"
+          cat response.txt || true
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Discord notification failed."
+            exit 1
+          fi
+
+          echo "Discord notification sent successfully."
